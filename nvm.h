@@ -185,4 +185,10 @@ extern uint8_t EEPROM_WriteNoVerify(eeprom_address_t index, eeprom_data_t value)
  */
 extern ValidTime APP_isSuitableTimeToWriteFlash(void);
 
+/**
+ * Read EEPROM.  
+ * @param index the address
+ * @return the value
+ */
+eeprom_data_t EEPROM_Read(eeprom_address_t index);
 #endif
