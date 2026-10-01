@@ -127,6 +127,9 @@ static Processed producerProcessMessage(Message *m) {
                 index = findEvent(0, (uint16_t)((m->bytes[2]<<8)|(m->bytes[3])));
             }
             if (index == NO_INDEX) return PROCESSED;
+            // KeithB b36: only answer for events this module produces; a response for a consume-only
+            // would contradict the real producer
+            if (!APP_isProducedEvent(index)) return PROCESSED;
 
             if (m->opc == OPC_AREQ) {
                 if (APP_GetEventIndexState(index) == EVENT_ON) {
@@ -177,9 +180,9 @@ void incrementProducerCounter() {
  */
 static uint8_t producerEsdData(uint8_t index) {
     switch (index){
-        case 0:
+        case 1:     // KeithB b42: ESD data is requested with index 1..3, not 0
             return PRODUCER_EV_HAPPENING;
-        case 1:
+        case 2:
             return HAPPENING_SIZE;
         default:
             return 0;

@@ -1,0 +1,451 @@
+diff -ruN --strip-trailing-cr orig/boot.c new/boot.c
+--- orig/boot.c	2026-09-27 20:36:22.168286497 +0000
++++ new/boot.c	2026-09-27 20:36:34.984811945 +0000
+@@ -248,6 +248,9 @@
+         case OPC_BOOT:
+             // Set the bootloader flag to be picked up by the bootloader
+             writeNVM(BOOT_FLAG_NVM_TYPE, BOOT_FLAG_ADDRESS, 0xFF); 
++#ifdef VLCB_EEPROM_ASYNC
++            flushNVM();  // KeithB b47, LCR-005: the boot flag must be on EEPROM before the reset
++#endif
+             RESET();     // will enter the bootloader
+             return PROCESSED;
+         default:
+diff -ruN --strip-trailing-cr orig/mns.c new/mns.c
+--- orig/mns.c	2026-09-27 20:36:22.169872810 +0000
++++ new/mns.c	2026-09-27 20:36:38.213732236 +0000
+@@ -487,6 +487,9 @@
+                 sendMessage2(OPC_NNREL, previousNN.bytes.hi, previousNN.bytes.lo);
+                 transport->waitForTxQueueToDrain();
+             }
++#ifdef VLCB_EEPROM_ASYNC
++            flushNVM();     // KeithB b47, LCR-005: queued NVM writes must land before the reset
++#endif
+             RESET();
+ #ifdef VLCB_DIAG
+         case OPC_RDGN:  // diagnostics
+@@ -608,6 +611,9 @@
+                                     // return and the switch fell through into OPC_NNRST -> RESET()
+ #endif
+         case OPC_NNRST: // reset CPU
++#ifdef VLCB_EEPROM_ASYNC
++            flushNVM();     // KeithB b47, LCR-005: queued NVM writes must land before the reset
++#endif
+             RESET();
+             return PROCESSED;   // should never get here
+         default:
+diff -ruN --strip-trailing-cr orig/nvm.c new/nvm.c
+--- orig/nvm.c	2026-09-27 20:36:22.168505230 +0000
++++ new/nvm.c	2026-09-27 20:38:06.492533912 +0000
+@@ -593,6 +593,228 @@
+     return GRSP_OK;
+ }
+ 
++#ifdef VLCB_EEPROM_ASYNC
++/*
++ * KeithB b47, LCR-004: background EEPROM writer (see nvm.h). Ported from the
++ * CanCan v4.63 writer. Q83 only: the K80 write path waits for completion in
++ * hardware, so there is nothing to overlap.
++ */
++#if !defined(_18FXXQ83_FAMILY_)
++#error "VLCB_EEPROM_ASYNC is implemented for the Q83 family only (b47 LCR-004)"
++#endif
++#if ((VLCB_EEPROM_ASYNC) < 2) || ((VLCB_EEPROM_ASYNC) > 255)
++#error "VLCB_EEPROM_ASYNC (queue depth) must be 2..255 (b47 LCR-004)"
++#endif
++#include "ticktime.h"
++
++#define NVM_ASYNC_DEPTH     ((uint8_t)(VLCB_EEPROM_ASYNC))
++#define NVM_ASYNC_ATTEMPTS  3
++#define NVM_ASYNC_WRAP(i)   ((uint8_t)(((uint16_t)(i)) % NVM_ASYNC_DEPTH))
++
++uint16_t nvmAsyncWrites = 0;
++uint16_t nvmAsyncFailures = 0;
++uint16_t nvmAsyncRefused = 0;
++uint16_t nvmAsyncFallbacks = 0;
++uint8_t  nvmAsyncHighWater = 0;
++
++static eeprom_address_t nvmAsyncAddr[NVM_ASYNC_DEPTH];
++static eeprom_data_t    nvmAsyncVal[NVM_ASYNC_DEPTH];
++static uint8_t  nvmAsyncHead = 0;
++static uint8_t  nvmAsyncCount = 0;      // entries queued, including the one in flight
++static uint8_t  nvmAsyncBusy = 0;       // head write started, not yet settled
++static uint8_t  nvmAsyncAttempt = 0;    // failed attempts on the head so far
++static TickValue nvmAsyncStart;         // when the head write started
++#ifdef VLCB_VDD_GUARD
++static uint8_t  nvmAsyncRefusing = 0;   // head refused by the VDD guard, waiting for the rail
++static TickValue nvmAsyncRefusedSince;
++#endif
++
++#define NVM_SAT_INC16(c)    do { if ((c) != 0xFFFFu) (c)++; } while (0)
++
++uint8_t nvmAsyncPending(void) {
++    return nvmAsyncCount;
++}
++
++#ifdef VLCB_VDD_GUARD
++/* The non-waiting form of vlcbVddWaitForWrite(): 1 = rail above the HLVD level
++ * (or the HLVD not running), 0 = low now. The background writer never waits. */
++static uint8_t nvmVddOkNow(void) {
++    if (!HLVDCON0bits.EN || !HLVDCON0bits.RDY) return 1;
++    return HLVDCON0bits.OUT ? 0 : 1;
++}
++#endif
++
++/* Start a byte write and return at once (the Q83 write runs in hardware). */
++static void nvmStartWrite(eeprom_address_t index, eeprom_data_t value) {
++    uint8_t interruptEnabled;
++    while (NVMCON0bits.GO)
++        ;
++    NVMCON1bits.WRERR = 0;
++    NVMADRU = 0x38;
++    NVMADRH = (uint8_t) (index >> 8);
++    NVMADRL = (uint8_t) index;
++    NVMDATL = value;
++    NVMCON1bits.NVMCMD = NVMCMD_WRITE;
++    interruptEnabled = geti();
++    bothDi();
++    NVMLOCK = 0x55;
++    NVMLOCK = 0xAA;
++    NVMCON0bits.GO = 1;
++    if (interruptEnabled) {
++        bothEi();
++    }
++}
++
++/* The head write has finished (or timed out): verify it. 1 = good. */
++static uint8_t nvmFinishWrite(eeprom_address_t index, eeprom_data_t value, uint8_t timedOut) {
++    uint8_t ok;
++    if (timedOut) {
++        while (NVMCON0bits.GO)      // cannot start another NVM operation until it ends
++            ;
++    }
++    ok = (!timedOut && !NVMCON1bits.WRERR) ? 1 : 0;
++    NVMCON1bits.WRERR = 0;
++    NVMCON1bits.NVMCMD = NVMCMD_NOP;
++    if (ok && (EEPROM_Read(index) != value)) {
++        ok = 0;
++    }
++    NVMADR = 0;
++    return ok;
++}
++
++static void nvmAsyncPop(void) {
++    nvmAsyncHead = NVM_ASYNC_WRAP(nvmAsyncHead + 1u);
++    nvmAsyncCount--;
++    nvmAsyncAttempt = 0;
++    nvmAsyncBusy = 0;
++#ifdef VLCB_VDD_GUARD
++    nvmAsyncRefusing = 0;
++#endif
++}
++
++static void nvmAsyncSettle(uint8_t ok) {
++    if (ok) {
++        NVM_SAT_INC16(nvmAsyncWrites);
++        nvmAsyncPop();
++    } else {
++#ifdef VLCB_DIAG
++        mnsDiagnostics[MNS_DIAGNOSTICS_MEMERRS].asUint++;
++        updateModuleErrorStatus();
++#endif
++        if (++nvmAsyncAttempt >= NVM_ASYNC_ATTEMPTS) {
++            NVM_SAT_INC16(nvmAsyncFailures);
++            nvmAsyncPop();
++        }
++        // else: stays at the head, not busy - the next step retries it
++    }
++}
++
++/* One step of the writer: start the head write, or settle it when done. */
++void nvmPoll(void) {
++    uint8_t h;
++    if (nvmAsyncCount == 0) return;
++    h = nvmAsyncHead;
++    if (!nvmAsyncBusy) {
++        if ((nvmAsyncAttempt == 0) && (EEPROM_Read(nvmAsyncAddr[h]) == nvmAsyncVal[h])) {
++            nvmAsyncPop();          // already holds the value: no write, no wear
++            return;
++        }
++#ifdef VLCB_VDD_GUARD
++        if (!nvmVddOkNow()) {
++            if (!nvmAsyncRefusing) {
++                nvmAsyncRefusing = 1;
++                nvmAsyncRefusedSince.val = tickNowGet();   // same clock as tickTimeSinceNow (b40)
++            } else if (tickTimeSinceNow(nvmAsyncRefusedSince) > ONE_SECOND) {
++                NVM_SAT_INC16(nvmAsyncRefused);
++                nvmAsyncPop();      // a rail that stays low must not pin the queue
++            }
++            return;
++        }
++        nvmAsyncRefusing = 0;
++#endif
++        nvmStartWrite(nvmAsyncAddr[h], nvmAsyncVal[h]);
++        nvmAsyncStart.val = tickNowGet();
++        nvmAsyncBusy = 1;
++        return;
++    }
++    if (NVMCON0bits.GO) {
++        if (tickTimeSinceNow(nvmAsyncStart) < HUNDRED_MILI_SECOND) {
++            return;                 // still writing - the normal case
++        }
++        nvmAsyncBusy = 0;
++        nvmAsyncSettle(nvmFinishWrite(nvmAsyncAddr[h], nvmAsyncVal[h], 1));
++        return;
++    }
++    nvmAsyncBusy = 0;
++    nvmAsyncSettle(nvmFinishWrite(nvmAsyncAddr[h], nvmAsyncVal[h], 0));
++}
++
++/* Drain the queue, blocking. Never loops on a low rail: a refused entry is
++ * dropped as refused (the synchronous writers would refuse it too). */
++void flushNVM(void) {
++    uint8_t h;
++    while (nvmAsyncCount != 0) {
++        h = nvmAsyncHead;
++        if (nvmAsyncBusy) {
++            while (NVMCON0bits.GO)
++                ;
++            nvmAsyncBusy = 0;
++            nvmAsyncSettle(nvmFinishWrite(nvmAsyncAddr[h], nvmAsyncVal[h], 0));
++            continue;
++        }
++        if ((nvmAsyncAttempt == 0) && (EEPROM_Read(nvmAsyncAddr[h]) == nvmAsyncVal[h])) {
++            nvmAsyncPop();
++            continue;
++        }
++        if (EEPROM_WriteNoVerify(nvmAsyncAddr[h], nvmAsyncVal[h]) != GRSP_OK) {
++            NVM_SAT_INC16(nvmAsyncRefused);     // VDD guard refused (it has already waited)
++            nvmAsyncPop();
++            continue;
++        }
++        while (NVMCON0bits.GO)
++            ;
++        nvmAsyncSettle(nvmFinishWrite(nvmAsyncAddr[h], nvmAsyncVal[h], 0));
++    }
++}
++
++static uint8_t nvmAsyncQueue(eeprom_address_t index, eeprom_data_t value) {
++    uint8_t i, k;
++    /* coalesce onto a waiting entry for the same cell (not the in-flight head) */
++    for (i = (nvmAsyncBusy ? 1u : 0u); i < nvmAsyncCount; i++) {
++        k = NVM_ASYNC_WRAP(nvmAsyncHead + i);
++        if (nvmAsyncAddr[k] == index) {
++            nvmAsyncVal[k] = value;
++            return GRSP_OK;
++        }
++    }
++    if (nvmAsyncCount >= NVM_ASYNC_DEPTH) {
++        NVM_SAT_INC16(nvmAsyncFallbacks);
++        flushNVM();                             // older writes first, then this one in line
++        return EEPROM_Write(index, value);
++    }
++    k = NVM_ASYNC_WRAP(nvmAsyncHead + nvmAsyncCount);
++    nvmAsyncAddr[k] = index;
++    nvmAsyncVal[k] = value;
++    nvmAsyncCount++;
++    if (nvmAsyncCount > nvmAsyncHighWater) {
++        nvmAsyncHighWater = nvmAsyncCount;
++    }
++    return GRSP_OK;
++}
++
++/* A queued value for this cell, newest first; -1 if none is queued. */
++static int16_t nvmAsyncLookup(eeprom_address_t index) {
++    uint8_t i, k;
++    for (i = nvmAsyncCount; i > 0; i--) {
++        k = NVM_ASYNC_WRAP(nvmAsyncHead + (uint8_t)(i - 1u));
++        if (nvmAsyncAddr[k] == index) {
++            return (int16_t) nvmAsyncVal[k];
++        }
++    }
++    return -1;
++}
++#endif  /* VLCB_EEPROM_ASYNC */
++
+ /**
+  * Write a single byte to NVM.
+  * @param type the type of memory to access
+@@ -603,7 +825,11 @@
+ uint8_t writeNVM(NVMtype type, uint24_t index, uint8_t value) {
+     switch(type) {
+         case EEPROM_NVM_TYPE:
++#ifdef VLCB_EEPROM_ASYNC
++            return nvmAsyncQueue((eeprom_address_t)index, value);   // KeithB b47, LCR-004
++#else
+             return EEPROM_Write((eeprom_address_t)index, value);
++#endif
+         case FLASH_NVM_TYPE:
+             return FLASH_Write((flash_address_t)index, value);
+         default:
+@@ -620,6 +846,12 @@
+ int16_t readNVM(NVMtype type, uint24_t index) {
+     switch(type) {
+         case EEPROM_NVM_TYPE:
++#ifdef VLCB_EEPROM_ASYNC
++            {   // KeithB b47, LCR-004: a queued value wins over the EEPROM cell
++                int16_t queued = nvmAsyncLookup((eeprom_address_t)index);
++                if (queued >= 0) return queued;
++            }
++#endif
+             return EEPROM_Read((uint16_t)index);
+         case FLASH_NVM_TYPE:
+ #if defined(_18F66K80_FAMILY_)
+diff -ruN --strip-trailing-cr orig/nvm.h new/nvm.h
+--- orig/nvm.h	2026-09-27 20:36:22.167942967 +0000
++++ new/nvm.h	2026-09-27 20:37:59.837378208 +0000
+@@ -191,4 +191,28 @@
+  * @return the value
+  */
+ eeprom_data_t EEPROM_Read(eeprom_address_t index);   // KeithB b14-25: used by CANPAN3 EEPROMbuffer.c to verify writes
++
++#ifdef VLCB_EEPROM_ASYNC
++/*
++ * KeithB b47, LCR-004 VLCB_EEPROM_ASYNC n (opt-in, Q83): EEPROM writes made
++ * through writeNVM() are queued (depth n) and written in the background, one
++ * step per nvmPoll() (called from vlcb.c poll()), so no write stalls the main
++ * loop for the ~11 ms byte-write time (MEM24). A second write to a queued cell
++ * replaces the queued value; readNVM() returns a queued value before it reaches
++ * EEPROM; each byte is verified and retried up to 3 times; with VLCB_VDD_GUARD a
++ * low rail holds the head entry (dropped as refused after 1 s). A full queue is
++ * drained and the write made in line - counted, never lost.
++ * flushNVM() drains the queue, blocking. The library calls it before every
++ * RESET() (LCR-005); an application must call it before any reset of its own.
++ * Counters (saturating at 65535) for an application's diagnostics.
++ */
++extern void nvmPoll(void);
++extern void flushNVM(void);
++extern uint16_t nvmAsyncWrites;       // bytes written and verified
++extern uint16_t nvmAsyncFailures;     // bytes abandoned after 3 failed attempts
++extern uint16_t nvmAsyncRefused;      // bytes dropped after 1 s of low-rail refusal
++extern uint16_t nvmAsyncFallbacks;    // writes made in line because the queue was full
++extern uint8_t  nvmAsyncHighWater;    // most entries ever queued
++extern uint8_t  nvmAsyncPending(void);  // entries queued now, including one in flight
++#endif
+ #endif
+\ No newline at end of file
+diff -ruN --strip-trailing-cr orig/vlcb.c new/vlcb.c
+--- orig/vlcb.c	2026-09-27 20:36:22.168300922 +0000
++++ new/vlcb.c	2026-09-27 20:37:19.759755672 +0000
+@@ -325,7 +325,10 @@
+ #pragma config EBTRB =     OFF      // Table Read Protect Boot (Disabled)
+ 
+ #endif
+-#if defined(_18FXXQ83_FAMILY_)
++/* KeithB b47, LCR-002 VLCB_APP_CONFIG (opt-in): the application supplies every
++ * configuration word itself (its own audited set, shared with its bootloader
++ * profile), so the library's Q83 block below is skipped. Undefined: unchanged. */
++#if defined(_18FXXQ83_FAMILY_) && !defined(VLCB_APP_CONFIG)
+ // Configuration bits: selected in the GUI
+ 
+ //CONFIG1
+@@ -987,7 +990,19 @@
+     // check for the push button being pressed at power up
+     if (APP_pbPressed()) {
+         // determine how long the button is held for
++#ifdef VLCB_PB_NO_BOOTLOADER_OFFSET
++        /* KeithB b47, LCR-007 (opt-in): with no bootloader in front of the
++         * application nobody has already held the button for ~2 s, so time from
++         * power-up and take the 2 s off: every band then means the same total
++         * hold as it does behind the bootloader (nothing < 3 s, test mode 3-6 s,
++         * factory reset from 10 s, ignored past 30 s). */
++        i = pbDownTimer(30);
++        if (i != PB_TIMEOUT) {
++            i = (i >= 2) ? (uint8_t)(i - 2) : 0;
++        }
++#else
+         i = pbDownTimer(28);
++#endif
+         if (i == 0) {
+             // A press shorter than one second: do nothing   KeithB b40
+             return;
+@@ -1007,6 +1022,9 @@
+             i = pbDownTimer(5);
+             if ((i>=2) && (i < 4)) {
+                 factoryReset();
++#ifdef VLCB_EEPROM_ASYNC
++                flushNVM();     // KeithB b47, LCR-005: the defaults must be on EEPROM before the reset
++#endif
+                 RESET();    // KeithB b35: restart so NV cache and service state reload the defaults
+             }
+         }
+@@ -1077,6 +1095,9 @@
+     Processed handled;
+ #endif
+     
++#ifdef VLCB_EEPROM_ASYNC
++    nvmPoll();      // KeithB b47, LCR-004: advance the background EEPROM writer by one step
++#endif
+     /* handle any timed responses */
+     // KeithB b40: tick read once per pass (tickNowGet), precomputed timed-response period
+     if (tickTimeSinceNow(timedResponseTime) > timedResponseTicks) {
+@@ -1485,7 +1506,20 @@
+ #ifdef TICK_ONCE_PER_PASS
+         tickNow.val = tickGet();    // KeithB b40: one tickGet() per pass (b42: written out so it cannot silently compile to nothing)
+ #endif
++#ifdef VLCB_POLL_DIVIDER
++        /* KeithB b47, LCR-003 (opt-in): poll the services every Nth pass so a
++         * fast application loop keeps its pass rate; loop() still runs every
++         * pass. tickNow above is still refreshed every pass. */
++        {
++            static uint8_t pollDivider = 0;
++            if (++pollDivider >= (uint8_t)(VLCB_POLL_DIVIDER)) {
++                pollDivider = 0;
++                poll();
++            }
++        }
++#else
+         poll();
++#endif
+         loop();
+     }
+ }
+@@ -1511,5 +1545,16 @@
+ void __interrupt(irq(default), base(IVT_BASE)) DEFAULT_ISR(void)
+ {
+ // Unhandled interrupts go here
++#ifdef VLCB_DEFAULT_ISR_RESET
++    /* KeithB b47, LCR-001 (opt-in): an enabled source with no handler never has
++     * its flag cleared, so an empty body re-enters forever - a silent hang with
++     * the watchdog off. Reset instead (PCON0 RI records it). With
++     * VLCB_DEFAULT_ISR_HOOK the application may record the event first; the hook
++     * must not rely on returning to normal operation. Undefined: empty body. */
++#ifdef VLCB_DEFAULT_ISR_HOOK
++    APP_unhandledInterrupt();
++#endif
++    RESET();
++#endif
+ }
+ #endif
+\ No newline at end of file
+diff -ruN --strip-trailing-cr orig/vlcb.h new/vlcb.h
+--- orig/vlcb.h	2026-09-27 20:36:22.168619110 +0000
++++ new/vlcb.h	2026-09-27 20:37:19.759902805 +0000
+@@ -489,6 +489,27 @@
+ #ifdef VLCB_EARLY_INIT
+ extern void APP_earlyInit(void);
+ #endif
++/*
++ * KeithB b47 opt-in options (see the fork's change-request log, LCR-001..007).
++ * Every one is off unless the application defines it in module.h; with none
++ * defined the library compiles exactly as b46.
++ *   VLCB_DEFAULT_ISR_RESET        LCR-001 the Q83 default ISR resets instead of returning
++ *   VLCB_DEFAULT_ISR_HOOK         LCR-001 ... after calling APP_unhandledInterrupt()
++ *   VLCB_APP_CONFIG               LCR-002 the application supplies all Q83 configuration words
++ *   VLCB_POLL_DIVIDER n           LCR-003 poll the services every nth main-loop pass (n >= 2)
++ *   VLCB_EEPROM_ASYNC n           LCR-004 background EEPROM writer, queue depth n (Q83; 2..255)
++ *                                 LCR-005 (no define) flushNVM() before every library RESET()
++ *   VLCB_PB_NO_BOOTLOADER_OFFSET  LCR-007 power-up button bands timed from power-up
++ */
++#ifdef VLCB_DEFAULT_ISR_HOOK
++#ifndef VLCB_DEFAULT_ISR_RESET
++#error "VLCB_DEFAULT_ISR_HOOK needs VLCB_DEFAULT_ISR_RESET (b47 LCR-001)"
++#endif
++extern void APP_unhandledInterrupt(void);
++#endif
++#if defined(VLCB_POLL_DIVIDER) && ((VLCB_POLL_DIVIDER) < 2 || (VLCB_POLL_DIVIDER) > 255)
++#error "VLCB_POLL_DIVIDER must be 2..255 (b47 LCR-003)"
++#endif
+ #if defined(VLCB_VDD_GUARD) && (defined(_18FXXQ83_FAMILY_) || defined(_18F66K80_FAMILY_))
+ #ifndef VLCB_VDD_STABLE_MS
+ #define VLCB_VDD_STABLE_MS       50

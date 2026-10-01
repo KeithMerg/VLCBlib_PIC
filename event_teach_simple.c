@@ -111,8 +111,10 @@ uint8_t numEv(uint8_t tableIndex);
 int16_t getEv(uint8_t tableIndex, uint8_t evNum);
 static uint8_t tableIndexToEvtIdx(uint8_t tableIndex);
 uint8_t findEvent(uint16_t nodeNumber, uint16_t eventNumber);
+void invalidateFindEventCache(void);   // KeithB b40
 static uint8_t removeTableEntry(uint8_t tableIndex);
 uint8_t removeEvent(uint16_t nodeNumber, uint16_t eventNumber);
+static void clearTableEntry(uint8_t tableIndex);   // KeithB b36
 static void doNnclr(void);
 static void doNerd(void);
 static void doNnevn(void);
@@ -152,6 +154,9 @@ static uint8_t timedResponseOpcode; // used to differentiate a timed response fo
 #define EVENTTABLE_OFFSET_ENL   3
 #define EVENTTABLE_OFFSET_FLAGS 4
 #define EVENTTABLE_OFFSET_EVS   5
+// KeithB b40: flash address of an event table row, computed once per access instead of
+// once per byte (the 24-bit multiply/add was being rebuilt for every readNVM/writeNVM call)
+#define EVENT_ROW_ADDRESS(tableIndex)   ((uint24_t)EVENT_TABLE_ADDRESS + (uint24_t)EVENTTABLE_WIDTH * (tableIndex))
 // The flags
 #define EVENT_FLAG_DEFAULT      1
 
@@ -163,7 +168,7 @@ static uint8_t timedResponseOpcode; // used to differentiate a timed response fo
  */
 const Service eventTeachService = {
     SERVICE_ID_OLD_TEACH,      // id
-    1,                  // version
+    3,                  // version
     teachFactoryReset,  // factoryReset
     teachPowerUp,       // powerUp
     teachProcessMessage,// processMessage
@@ -259,6 +264,15 @@ static Processed teachProcessMessage(Message* m) {
             // Do learn
             doEvlrn((uint16_t)(m->bytes[0]<<8) | (m->bytes[1]), (uint16_t)(m->bytes[2]<<8) | (m->bytes[3]), m->bytes[4], m->bytes[5]);
             return PROCESSED;
+        case OPC_EVLRNI:    // F5 EVLRNI - NN, EN, EN#, EV#, EVval
+            // KeithB b35: was not handled. Events are located by NN/EN so EN# is not needed.
+            if (teachCheckLen(m, 8, 1) == PROCESSED) {
+                sendMessage3(OPC_CMDERR, nn.bytes.hi, nn.bytes.lo, CMDERR_INV_CMD);
+                return PROCESSED;
+            }
+            if (! (mode_flags & FLAG_MODE_LEARN)) return PROCESSED;
+            doEvlrn((uint16_t)(m->bytes[0]<<8) | (m->bytes[1]), (uint16_t)(m->bytes[2]<<8) | (m->bytes[3]), m->bytes[5], m->bytes[6]);
+            return PROCESSED;
         case OPC_EVULN:     // 95 EVULN - NN, EN
             if (teachCheckLen(m, 5, 1) == PROCESSED) return PROCESSED;
             if (! (mode_flags & FLAG_MODE_LEARN)) return PROCESSED;
@@ -303,6 +317,12 @@ static Processed teachProcessMessage(Message* m) {
             if ((m->bytes[0] != nn.bytes.hi) || (m->bytes[1] != nn.bytes.lo)) return PROCESSED;  // not us
             // do NNEVN
             doNnevn();
+            return PROCESSED;
+        case OPC_NENRD:     // 72 NENRD - NN, EN#
+            // KeithB b35: was not handled
+            if (teachCheckLen(m, 4, 0) == PROCESSED) return PROCESSED;
+            if ((m->bytes[0] != nn.bytes.hi) || (m->bytes[1] != nn.bytes.lo)) return PROCESSED;  // not us
+            doNenrd(m->bytes[2]);
             return PROCESSED;
         case OPC_RQEVN:     // 58 RQEVN - NN
             if (teachCheckLen(m, 3, 0) == PROCESSED) return PROCESSED;
@@ -388,9 +408,11 @@ static DiagnosticVal * teachGetDiagnostic(uint8_t index) {
 void clearAllEvents(void) {
     uint8_t tableIndex;
 
+    // KeithB b36: clear every row, then flush and rebuild once (was per row: O(n^2), seconds)
     for (tableIndex=0; tableIndex<NUM_EVENTS; tableIndex++) {
-        removeTableEntry(tableIndex);
+        clearTableEntry(tableIndex);
     }
+    flushFlashBlock();
 #ifdef EVENT_HASH_TABLE
     rebuildHashtable();
 #endif
@@ -467,7 +489,7 @@ static void doNenrd(uint8_t index) {
     }
     nodeNumber = getNN(tableIndex);
     eventNumber = getEN(tableIndex);
-    sendMessage7(OPC_ENRSP, nn.bytes.hi, nn.bytes.lo, nodeNumber>>8, nodeNumber&0xFF, eventNumber>>8, eventNumber&0xFF, tableIndex);
+    sendMessage7(OPC_ENRSP, nn.bytes.hi, nn.bytes.lo, nodeNumber>>8, nodeNumber&0xFF, eventNumber>>8, eventNumber&0xFF, index);   // KeithB b35: was tableIndex
 
 } // doNenrd
 
@@ -553,7 +575,7 @@ static void doReval(uint8_t enNum, uint8_t evNum) {
     int evVal;
     
     if (tableIndex >= NUM_EVENTS) {
-        sendMessage3(OPC_CMDERR, nn.bytes.hi, nn.bytes.lo, CMDERR_INV_EV_IDX);
+        sendMessage3(OPC_CMDERR, nn.bytes.hi, nn.bytes.lo, CMDERR_INV_EN_IDX);   // KeithB b40: it is the event index that is bad
         return;
     }
 
@@ -679,7 +701,7 @@ TimedResponseResult reqevCallback(uint8_t tableIndex, uint8_t serviceIndex, uint
         if (timedResponseOpcode == OPC_EVANS) {
             sendMessage6(OPC_EVANS, nodeNumber.bytes.hi, nodeNumber.bytes.lo, eventNumber.bytes.hi, eventNumber.bytes.lo, step+1, (uint8_t)ev);
         } else {
-            sendMessage5(OPC_NEVAL, nodeNumber.bytes.hi, nodeNumber.bytes.lo, tableIndexToEvtIdx(tableIndex), step+1, (uint8_t)ev);
+            sendMessage5(OPC_NEVAL, nn.bytes.hi, nn.bytes.lo, tableIndexToEvtIdx(tableIndex), step+1, (uint8_t)ev);   // KeithB b36: module NN, not the event's
         }
     }
     return TIMED_RESPONSE_RESULT_NEXT;
@@ -706,21 +728,22 @@ uint8_t removeEvent(uint16_t nodeNumber, uint16_t eventNumber) {
  * @param tableIndex which event to be cleared
  * @return error or 0 for success
  */
-static uint8_t removeTableEntry(uint8_t tableIndex) {
+// KeithB b36: split out of removeTableEntry() so clearAllEvents() can flush once
+static void clearTableEntry(uint8_t tableIndex) {
     uint8_t i;
+    uint24_t row = EVENT_ROW_ADDRESS(tableIndex);   // KeithB b40: row address once
+    invalidateFindEventCache();   // KeithB b40
+    // set the NN and EN to zero, the flags and all the EVs (NNH..EVs are contiguous)
+    for (i=0; i<EVENTTABLE_OFFSET_EVS+PARAM_NUM_EV_EVENT; i++) {
+        writeNVM(EVENT_TABLE_NVM_TYPE, row + i, 0x00);
+    }
+}
+
+static uint8_t removeTableEntry(uint8_t tableIndex) {
 #ifdef SAFETY
     if (tableIndex >= NUM_EVENTS) return CMDERR_INV_EV_IDX;
 #endif
-    // set the NN and EN to zero
-    writeNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex + EVENTTABLE_OFFSET_NNH, 0x00);
-    writeNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex + EVENTTABLE_OFFSET_NNL, 0x00);
-    writeNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex + EVENTTABLE_OFFSET_ENH, 0x00);
-    writeNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex + EVENTTABLE_OFFSET_ENL, 0x00);
-    writeNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex + EVENTTABLE_OFFSET_FLAGS, 0x00);
-        
-    for (i=0; i<PARAM_NUM_EV_EVENT; i++) {
-        writeNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex + (EVENTTABLE_OFFSET_EVS + i), 0x00);
-    }
+    clearTableEntry(tableIndex);
     flushFlashBlock();
 #ifdef EVENT_HASH_TABLE
     rebuildHashtable();
@@ -744,10 +767,19 @@ static uint8_t removeTableEntry(uint8_t tableIndex) {
  */
 uint8_t addEvent(uint16_t nodeNumber, uint16_t eventNumber, uint8_t evNum, uint8_t evVal, Boolean forceOwnNN) {
     uint8_t tableIndex;
-    
+
+    errno = 0;  // KeithB b36: was left stale from an earlier failure
     // do we currently have an event
     tableIndex = findEvent(nodeNumber, eventNumber);
     if (tableIndex == NO_INDEX) {
+#ifdef EVENT_HASH_TABLE
+        // KeithB b36: refuse if the hash chain for this event is full, otherwise the
+        // event would be stored but never found (and re-teaching would duplicate it)
+        if (eventChains[getHash(nodeNumber, eventNumber)][EVENT_CHAIN_LENGTH-1] != NO_INDEX) {
+            errno = CMDERR_TOO_MANY_EVENTS;
+            return NO_INDEX;
+        }
+#endif
         errno = CMDERR_TOO_MANY_EVENTS;
         // didn't find the event so find an empty slot and create one
         for (tableIndex=0; tableIndex<NUM_EVENTS; tableIndex++) {
@@ -782,7 +814,12 @@ uint8_t addEvent(uint16_t nodeNumber, uint16_t eventNumber, uint8_t evNum, uint8
         return NO_INDEX;
     }
     // success
+#ifndef FLASH_DEFER_EVENT_FLUSH
     flushFlashBlock();
+#endif
+    // KeithB b48: with FLASH_DEFER_EVENT_FLUSH the page stays in the RAM buffer (reads are
+    // served from it) and is written on a page change or by poll() once teaching goes quiet
+    invalidateFindEventCache();   // KeithB b40
 #ifdef EVENT_HASH_TABLE
     rebuildHashtable();
 #endif
@@ -796,30 +833,52 @@ uint8_t addEvent(uint16_t nodeNumber, uint16_t eventNumber, uint8_t evNum, uint8
  * @param eventNumber event EN
  * @return index into event table or NO_INDEX if not present
  */
+// KeithB b40: one-entry cache of the last successful lookup. An incoming event is looked up
+// by the application's pre-processing and again by the consumer service with the same
+// NN/EN, so the second hash-chain walk (up to 20 rows of flash reads) was pure repetition.
+// Invalidated whenever a row's NN/EN can change: rebuildHashtable(), clearTableEntry(), addEvent().
+static uint16_t findCacheNN;
+static uint16_t findCacheEN;
+static uint16_t findCacheModuleNN;   // KeithB b42: rows with EVENT_FLAG_DEFAULT resolve to the module NN, so a NN change invalidates too
+static uint8_t  findCacheIndex = NO_INDEX;
+
+void invalidateFindEventCache(void) {
+    findCacheIndex = NO_INDEX;
+}
+
 uint8_t findEvent(uint16_t nodeNumber, uint16_t eventNumber) {
+    if ((findCacheIndex != NO_INDEX) && (findCacheNN == nodeNumber) && (findCacheEN == eventNumber) && (findCacheModuleNN == nn.word)) {   // KeithB b42
+        return findCacheIndex;
+    }
 #ifdef EVENT_HASH_TABLE
+    {
     uint8_t hash = getHash(nodeNumber, eventNumber);
     uint8_t chainIdx;
     for (chainIdx=0; chainIdx<EVENT_CHAIN_LENGTH; chainIdx++) {
         uint8_t tableIndex = eventChains[hash][chainIdx];
-        uint16_t nn, en;
+        uint16_t rowNN, rowEN;   // KeithB b42: renamed, the old 'nn' shadowed the module NN
         if (tableIndex == NO_INDEX) return NO_INDEX;
-        nn = getNN(tableIndex);
-        en = getEN(tableIndex);
-        if ((nn == nodeNumber) && (en == eventNumber)) {
+        rowNN = getNN(tableIndex);
+        rowEN = getEN(tableIndex);
+        if ((rowNN == nodeNumber) && (rowEN == eventNumber)) {
+            findCacheNN = nodeNumber; findCacheEN = eventNumber; findCacheModuleNN = nn.word; findCacheIndex = tableIndex;
             return tableIndex;
         }
     }
+    }
 #else
+    {
     uint8_t tableIndex;
     for (tableIndex=0; tableIndex < NUM_EVENTS; tableIndex++) {
         uint16_t b = getEN(tableIndex);
         if (b == eventNumber) {
             b = getNN(tableIndex);
             if (b == nodeNumber) {
+                findCacheNN = nodeNumber; findCacheEN = eventNumber; findCacheModuleNN = nn.word; findCacheIndex = tableIndex;
                 return tableIndex;
             }
         }
+    }
     }
 #endif
     return NO_INDEX;
@@ -855,12 +914,12 @@ uint8_t writeEv(uint8_t tableIndex, uint8_t evNum, uint8_t evVal) {
  */
 int16_t getEv(uint8_t tableIndex, uint8_t evNum) {
     if (tableIndex >= NUM_EVENTS) {
-        return CMDERR_INV_EN_IDX;
+        return -CMDERR_INV_EN_IDX;   // KeithB b36: errors are negative
     }
     if (evNum >= PARAM_NUM_EV_EVENT) {
         return -CMDERR_INV_EV_IDX;
     }
-    return (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex+EVENTTABLE_OFFSET_EVS+evNum);
+    return (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, EVENT_ROW_ADDRESS(tableIndex) + EVENTTABLE_OFFSET_EVS + evNum);   // KeithB b40
 }
 
 /**
@@ -890,8 +949,11 @@ uint8_t getEVs(uint8_t tableIndex) {
         return CMDERR_INV_EN_IDX;
     }
 
+    {
+    uint24_t addr = EVENT_ROW_ADDRESS(tableIndex) + EVENTTABLE_OFFSET_EVS;   // KeithB b40: hoisted out of the loop
     for (evIdx=0; evIdx < PARAM_NUM_EV_EVENT; evIdx++) {
-        evs[evIdx] = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex+EVENTTABLE_OFFSET_EVS+evIdx);
+        evs[evIdx] = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, addr++);
+    }
     }
     return 0;
 }
@@ -911,12 +973,15 @@ uint16_t getNN(uint8_t tableIndex) {
         return CMDERR_INV_EN_IDX;
     }
     
-    flags = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex+EVENTTABLE_OFFSET_FLAGS);
+    {
+    uint24_t row = EVENT_ROW_ADDRESS(tableIndex);   // KeithB b40: row address once
+    flags = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, row + EVENTTABLE_OFFSET_FLAGS);
     if (flags & EVENT_FLAG_DEFAULT) {
         return nn.word;
     }
-    lo = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex+EVENTTABLE_OFFSET_NNL);
-    hi = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex+EVENTTABLE_OFFSET_NNH);
+    lo = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, row + EVENTTABLE_OFFSET_NNL);
+    hi = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, row + EVENTTABLE_OFFSET_NNH);
+    }
     return lo | (hi << 8);
 }
 
@@ -931,8 +996,11 @@ uint16_t getEN(uint8_t tableIndex) {
     uint16_t hi;
     uint16_t lo;
     
-    lo = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex+EVENTTABLE_OFFSET_ENL);
-    hi = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, EVENT_TABLE_ADDRESS + EVENTTABLE_WIDTH*tableIndex+EVENTTABLE_OFFSET_ENH);
+    {
+    uint24_t row = EVENT_ROW_ADDRESS(tableIndex);   // KeithB b40: row address once
+    lo = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, row + EVENTTABLE_OFFSET_ENL);
+    hi = (uint8_t)readNVM(EVENT_TABLE_NVM_TYPE, row + EVENTTABLE_OFFSET_ENH);
+    }
     return lo | (hi << 8);
 }
 
@@ -998,9 +1066,9 @@ uint8_t getHash(uint16_t nn, uint16_t en) {
 void rebuildHashtable(void) {
     // invalidate the current hash table
     uint8_t hash;
+    invalidateFindEventCache();   // KeithB b40
     uint8_t chainIdx;
     uint8_t tableIndex;
-    int a;
 
     for (hash=0; hash<EVENT_HASH_LENGTH; hash++) {
         for (chainIdx=0; chainIdx < EVENT_CHAIN_LENGTH; chainIdx++) {
@@ -1009,11 +1077,10 @@ void rebuildHashtable(void) {
     }
     // now scan the event2Action table and populate the hash and lookup tables
     for (tableIndex=0; tableIndex<NUM_EVENTS; tableIndex++) {
-        if (getEN(tableIndex) != 0) {
-            int16_t ev;
-    
+        uint16_t en = getEN(tableIndex);   // KeithB b36: read once
+        if (en != 0) {
             // found the start of an event definition
-            hash = getHash(getNN(tableIndex), getEN(tableIndex));            
+            hash = getHash(getNN(tableIndex), en);
             for (chainIdx=0; chainIdx<EVENT_CHAIN_LENGTH; chainIdx++) {
                 if (eventChains[hash][chainIdx] == NO_INDEX) {
                     // available

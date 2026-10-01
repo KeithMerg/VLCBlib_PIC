@@ -239,6 +239,7 @@ void bootPowerUp(void) {
  * @return PROCESSED to indicate that the message has been processed, NOT_PROCESSED otherwise
  */
 static Processed bootProcessMessage(Message * m) {
+    if (m->len < 3) return NOT_PROCESSED;   // KeithB b35: short frame could match stale NN bytes
     // check NN matches us
     if (m->bytes[0] != nn.bytes.hi) return NOT_PROCESSED;
     if (m->bytes[1] != nn.bytes.lo) return NOT_PROCESSED;
@@ -247,6 +248,10 @@ static Processed bootProcessMessage(Message * m) {
         case OPC_BOOT:
             // Set the bootloader flag to be picked up by the bootloader
             writeNVM(BOOT_FLAG_NVM_TYPE, BOOT_FLAG_ADDRESS, 0xFF); 
+            flushFlashBlock();   // KeithB b48: write any buffered event page before the reset
+#ifdef VLCB_EEPROM_ASYNC
+            flushNVM();  // KeithB b47, LCR-005: the boot flag must be on EEPROM before the reset
+#endif
             RESET();     // will enter the bootloader
             return PROCESSED;
         default:
