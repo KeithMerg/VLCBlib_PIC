@@ -111,8 +111,10 @@
 
 //CONFIG5
 #pragma config WDTCPS =  WDTCPS_31     // WDT Period selection bits->Divider ratio 1:65536; software control of WDTPS
-//#pragma config WDTE =    SWDTEN  // WDT operating mode->enabled/disabled by WDTCON0.SEN (resets to 0 = off), as the bootloader
-#pragma config WDTE = OFF     // WDT operating mode->WDT Disabled; SWDTEN is ignored
+#pragma config WDTE =    SWDTEN  // WDT operating mode->enabled/disabled by WDTCON0.SEN (resets to 0 = off), as the bootloader
+// KeithB: must equal the bootloader's hwsettings.c, or the unified hex fails (hexmate: conflict at 0x300004).
+// The WDT stays off unless the application sets WDTCON0.SEN, so this behaves as WDTE = OFF.
+//#pragma config WDTE = OFF     // WDT operating mode->WDT Disabled; SWDTEN is ignored
 
 //CONFIG6
 #pragma config WDTCWS =  WDTCWS_7     // WDT Window Select bits->window always open (100%); software control; keyed access not required
