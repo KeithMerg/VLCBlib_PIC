@@ -133,7 +133,10 @@ static Processed consumerProcessMessage(Message *m) {
 #endif
     
     if (m->len < 5) return NOT_PROCESSED;
-    enn = 1;    // KeithB b35: marker, replaced by the sender NN for long events
+    // The node number of the event. This must be set BEFORE the switch below
+    // because the switch overrides it with 0 for short events (the event table
+    // holds short events with NN 0, whatever node sent the ASON/ASOF).
+    enn = ((uint16_t)m->bytes[0])*256+m->bytes[1];
     switch (m->opc) {
         case OPC_ASON:
 #ifdef HANDLE_DATA_EVENTS
@@ -173,7 +176,8 @@ static Processed consumerProcessMessage(Message *m) {
     ret = NOT_PROCESSED;
     for (tableIndex = 0; tableIndex < NUM_EVENTS; tableIndex++) {
         if (isConsumedEvent(tableIndex)) {
-            if (getNN(tableIndex) == ((uint16_t)(m->bytes[0])*256+m->bytes[1])) {
+            // enn is the event's node number, already 0 for a short event
+            if (getNN(tableIndex) == enn) {
                 if (getEN(tableIndex) == ((uint16_t)(m->bytes[2])*256+m->bytes[3])) {
                     if (APP_processConsumedEvent(tableIndex, m) == PROCESSED) {
                         ret = PROCESSED;
@@ -183,7 +187,7 @@ static Processed consumerProcessMessage(Message *m) {
         }
     }
     if (ret == PROCESSED) {
-        if ((mode_flags & FLAG_MODE_EVENTACK) && (isConsumedEvent(tableIndex))) {
+        if (mode_flags & FLAG_MODE_EVENTACK) {
             // send the ack
             sendMessage7(OPC_ENACK, nn.bytes.hi, nn.bytes.lo, (uint8_t)(m->opc), m->bytes[0], m->bytes[1], m->bytes[2], m->bytes[3]);
 #ifdef VLCB_DIAG
@@ -192,10 +196,6 @@ static Processed consumerProcessMessage(Message *m) {
         }
     }
 #else
-    // KeithB b35: enn is 0 for short events (set above); only long events use the sender NN
-    if (enn != 0) {
-        enn = ((uint16_t)m->bytes[0])*256+m->bytes[1];
-    }
     tableIndex = findEvent(enn, ((uint16_t)m->bytes[2])*256+m->bytes[3]);
     if (tableIndex == NO_INDEX) return NOT_PROCESSED;
 
