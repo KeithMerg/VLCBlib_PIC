@@ -554,7 +554,7 @@ static void doEvlrni(uint8_t enNum, uint8_t nnh, uint8_t nnl, uint8_t enh, uint8
     if (evNum > PARAM_NUM_EV_EVENT) {
         sendMessage3(OPC_CMDERR, nn.bytes.hi, nn.bytes.lo, CMDERR_INV_EV_IDX);
 #ifdef VLCB_GRSP
-        sendMessage5(OPC_GRSP, nn.bytes.hi, nn.bytes.lo, OPC_EVLRN, SERVICE_ID_INDEXED_TEACH, CMDERR_INV_EV_IDX);
+        sendMessage5(OPC_GRSP, nn.bytes.hi, nn.bytes.lo, OPC_EVLRNI, SERVICE_ID_INDEXED_TEACH, CMDERR_INV_EV_IDX);
 #endif
         return;
     }
@@ -563,7 +563,7 @@ static void doEvlrni(uint8_t enNum, uint8_t nnh, uint8_t nnl, uint8_t enh, uint8
         // validation error
         sendMessage3(OPC_CMDERR, nn.bytes.hi, nn.bytes.lo, errno);
 #ifdef VLCB_GRSP
-        sendMessage5(OPC_GRSP, nn.bytes.hi, nn.bytes.lo, OPC_EVLRN, SERVICE_ID_INDEXED_TEACH, errno);
+        sendMessage5(OPC_GRSP, nn.bytes.hi, nn.bytes.lo, OPC_EVLRNI, SERVICE_ID_INDEXED_TEACH, errno);
 #endif
         return;
     }
@@ -572,7 +572,7 @@ static void doEvlrni(uint8_t enNum, uint8_t nnh, uint8_t nnl, uint8_t enh, uint8
 #endif
     sendMessage2(OPC_WRACK, nn.bytes.hi, nn.bytes.lo);
 #ifdef VLCB_GRSP
-    sendMessage5(OPC_GRSP, nn.bytes.hi, nn.bytes.lo, OPC_EVLRN, SERVICE_ID_INDEXED_TEACH, GRSP_OK);
+    sendMessage5(OPC_GRSP, nn.bytes.hi, nn.bytes.lo, OPC_EVLRNI, SERVICE_ID_INDEXED_TEACH, GRSP_OK);
 #endif
     return;
 }
